@@ -1,0 +1,72 @@
+diff --git a/klippy/extras/mlock.py b/klippy/extras/mlock.py
+new file mode 100644
+index 0000000..ee7bac9
+--- /dev/null
++++ b/klippy/extras/mlock.py
+@@ -0,0 +1,66 @@
++# Keep klippy resident in RAM.
++#
++# Klipper has hard real-time deadlines towards the MCUs (trsync during
++# homing, the move queue during a print). On a host with little RAM and an
++# aggressive swap policy the kernel is free to page klippy out, and a major
++# page fault at the wrong moment shows up as "Timer too close" or "Unable to
++# obtain 'trsync_state' response". Locking the process in memory takes the
++# kernel out of that decision.
++#
++# [mlock]
++#
++# Copyright (C) 2026  COSMOS contributors
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++import ctypes
++import logging
++import resource
++
++MCL_CURRENT = 1
++MCL_FUTURE = 2
++# Lock pages as they are first touched instead of faulting the whole address
++# space in at once (Linux 4.4+). Falls back to a plain lock if unsupported.
++MCL_ONFAULT = 4
++
++
++class MemLock:
++    def __init__(self, config):
++        printer = config.get_printer()
++        try:
++            resource.setrlimit(
++                resource.RLIMIT_MEMLOCK,
++                (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
++            )
++        except (ValueError, OSError) as e:
++            logging.warning("mlock: could not raise RLIMIT_MEMLOCK: %s", e)
++        libc = ctypes.CDLL(None, use_errno=True)
++        flags = MCL_CURRENT | MCL_FUTURE
++        rc = libc.mlockall(flags | MCL_ONFAULT)
++        if rc != 0 and ctypes.get_errno() == 22:  # EINVAL: no MCL_ONFAULT
++            rc = libc.mlockall(flags)
++        if rc != 0:
++            err = ctypes.get_errno()
++            logging.warning("mlock: mlockall failed: errno %d", err)
++            return
++        printer.register_event_handler("klippy:ready", self._report)
++
++    def _report(self):
++        try:
++            with open("/proc/self/status") as f:
++                st = dict(
++                    l.split(":", 1)
++                    for l in f
++                    if l.startswith(("VmLck", "VmRSS", "VmSwap"))
++                )
++            logging.info(
++                "mlock: locked %s resident %s swapped %s",
++                st.get("VmLck", "?").strip(),
++                st.get("VmRSS", "?").strip(),
++                st.get("VmSwap", "?").strip(),
++            )
++        except OSError:
++            pass
++
++
++def load_config(config):
++    return MemLock(config)
